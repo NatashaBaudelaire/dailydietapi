@@ -2,7 +2,7 @@
   Daily Diet API
 </h1>
 
-![Image](![Image](https://github.com/user-attachments/assets/eac3ede8-d0e6-4bea-bd84-35be687c2e97))
+![Image](https://github.com/user-attachments/assets/eac3ede8-d0e6-4bea-bd84-35be687c2e97)
 
 ## Objective
 
