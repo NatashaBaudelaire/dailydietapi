@@ -1,9 +1,13 @@
+import os
 from flask import Blueprint, request, jsonify, url_for
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
 from app import db
 from app.models.meal import Meal
-from app.schemas.meal_schema import validate_meal_data, validate_meal_update
+from flask_pydantic import validate
+from app.schemas.meal_schema import MealCreateSchema, MealUpdateSchema
 from app.decorators import token_required
+from app.services.s3_service import upload_file_to_s3
+from app.services.email_service import send_email
 
 meals_bp = Blueprint('meals', __name__, url_prefix='')
 
@@ -20,6 +24,8 @@ def index():
             str(url_for('user.get_profile', _external=True)) + ' (token required)',
             str(url_for('user.update_profile', _external=True)) + ' (token required)',
             str(url_for('user.update_password', _external=True)) + ' (token required)',
+            str(url_for('user.follow', username='<username>', _external=True)) + ' (token required)',
+            str(url_for('user.unfollow', username='<username>', _external=True)) + ' (token required)',
         ],
         'meal_endpoints': [
             str(url_for('meals.health_check', _external=True)),
@@ -30,6 +36,13 @@ def index():
             str(url_for('meals.delete_meal', meal_id=1, _external=True)) + ' (token required)',
             str(url_for('meals.get_user_stats', _external=True)) + ' (token required)',
             str(url_for('meals.get_best_diet_sequence', _external=True)) + ' (token required)',
+            str(url_for('meals.get_meal_reports', _external=True)) + ' (token required)',
+            str(url_for('meals.upload_meal_image', meal_id=1, _external=True)) + ' (token required)',
+            str(url_for('meals.send_meal_reminders', _external=True)) + ' (token required)',
+        'social_endpoints': [
+            str(url_for('social.share_meals', _external=True)) + ' (token required)',
+            str(url_for('social.get_shared_item', shared_item_id=1, _external=True)) + ' (token required)',
+            str(url_for('social.get_feed', _external=True)) + ' (token required)',
         ]
     }), 200
 
@@ -45,26 +58,21 @@ def health_check():
 
 @meals_bp.route('/meals', methods=['POST'])
 @token_required
-def create_meal(current_user):
+@validate()
+def create_meal(current_user, body: MealCreateSchema):
     '''Register a new meal for the authenticated user'''
     try:
-        data = request.get_json()
-        
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
-        
-        errors = validate_meal_data(data)
-        if errors:
-            return jsonify({'error': 'Validation failed', 'details': errors}), 400
-        
-        meal_datetime = datetime.fromisoformat(data['datetime'])
-        
         new_meal = Meal(
-            name=data['name'].strip(),
-            description=data['description'].strip(),
-            datetime=meal_datetime,
-            is_on_diet=data['is_on_diet'],
-            user_id=current_user.id
+            name=body.name,
+            description=body.description,
+            datetime=body.datetime,
+            is_on_diet=body.is_on_diet,
+            user_id=current_user.id,
+            category=body.category,
+            calories=body.calories,
+            protein_grams=body.protein_grams,
+            carbohydrates_grams=body.carbohydrates_grams,
+            fats_grams=body.fats_grams
         )
         
         db.session.add(new_meal)
@@ -139,7 +147,8 @@ def get_meal(current_user, meal_id):
 
 @meals_bp.route('/meals/<int:meal_id>', methods=['PUT'])
 @token_required
-def update_meal(current_user, meal_id):
+@validate()
+def update_meal(current_user, meal_id, body: MealUpdateSchema):
     '''Edit an existing meal, if it belongs to the user'''
     try:
         meal = Meal.query.filter_by(id=meal_id, user_id=current_user.id).first()
@@ -147,26 +156,9 @@ def update_meal(current_user, meal_id):
         if not meal:
             return jsonify({'error': 'Meal not found or you do not have permission to edit it'}), 404
         
-        data = request.get_json()
-        
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
-        
-        errors = validate_meal_update(data)
-        if errors:
-            return jsonify({'error': 'Validation failed', 'details': errors}), 400
-        
-        if 'name' in data:
-            meal.name = data['name'].strip()
-        
-        if 'description' in data:
-            meal.description = data['description'].strip()
-        
-        if 'datetime' in data:
-            meal.datetime = datetime.fromisoformat(data['datetime'])
-        
-        if 'is_on_diet' in data:
-            meal.is_on_diet = data['is_on_diet']
+        update_data = body.dict(exclude_unset=True)
+        for key, value in update_data.items():
+            setattr(meal, key, value)
         
         meal.updated_at = datetime.now(timezone.utc)
         
@@ -187,7 +179,7 @@ def update_meal(current_user, meal_id):
 def delete_meal(current_user, meal_id):
     '''Delete a meal, if it belongs to the user'''
     try:
-        meal = Meal.query.filter_by(id=meal_id, user_id=current_user.id).first()
+        meal = Meal.query.filter_by(id=meal_id, user__id=current_user.id).first()
         
         if not meal:
             return jsonify({'error': 'Meal not found or you do not have permission to delete it'}), 404
@@ -269,3 +261,119 @@ def get_best_diet_sequence(current_user):
         
     except Exception as e:
         return jsonify({'error': f'Failed to retrieve best sequence: {str(e)}'}), 500
+
+@meals_bp.route('/meals/reports', methods=['GET'])
+@token_required
+def get_meal_reports(current_user):
+    '''Generate daily, weekly, or monthly meal reports'''
+    try:
+        period = request.args.get('period', 'daily', type=str)
+        report_date_str = request.args.get('date', date.today().isoformat(), type=str)
+        report_date = date.fromisoformat(report_date_str)
+
+        if period == 'daily':
+            start_date = datetime.combine(report_date, datetime.min.time(), tzinfo=timezone.utc)
+            end_date = start_date + timedelta(days=1)
+        elif period == 'weekly':
+            start_date = datetime.combine(report_date - timedelta(days=report_date.weekday()), datetime.min.time(), tzinfo=timezone.utc)
+            end_date = start_date + timedelta(days=7)
+        elif period == 'monthly':
+            start_date = datetime.combine(report_date.replace(day=1), datetime.min.time(), tzinfo=timezone.utc)
+            next_month = start_date.replace(day=28) + timedelta(days=4)
+            end_date = datetime.combine(next_month - timedelta(days=next_month.day), datetime.min.time(), tzinfo=timezone.utc)
+        else:
+            return jsonify({'error': 'Invalid period specified. Use daily, weekly, or monthly.'}), 400
+
+        meals = Meal.query.filter(
+            Meal.user_id == current_user.id,
+            Meal.datetime >= start_date,
+            Meal.datetime < end_date
+        ).all()
+
+        total_meals = len(meals)
+        total_calories = sum(meal.calories for meal in meals if meal.calories)
+        total_protein = sum(meal.protein_grams for meal in meals if meal.protein_grams)
+        total_carbs = sum(meal.carbohydrates_grams for meal in meals if meal.carbohydrates_grams)
+        total_fats = sum(meal.fats_grams for meal in meals if meal.fats_grams)
+
+        report = {
+            'user_id': current_user.id,
+            'period': period,
+            'start_date': start_date.isoformat(),
+            'end_date': end_date.isoformat(),
+            'total_meals': total_meals,
+            'total_calories': total_calories,
+            'average_calories_per_meal': round(total_calories / total_meals, 2) if total_meals > 0 else 0,
+            'total_protein_grams': total_protein,
+            'total_carbohydrates_grams': total_carbs,
+            'total_fats_grams': total_fats,
+            'meals': [meal.to_dict() for meal in meals]
+        }
+
+        return jsonify(report), 200
+
+    except Exception as e:
+        return jsonify({'error': f'Failed to generate report: {str(e)}'}), 500
+
+@meals_bp.route('/meals/<int:meal_id>/image', methods=['POST'])
+@token_required
+def upload_meal_image(current_user, meal_id):
+    '''Upload an image for a meal'''
+    try:
+        meal = Meal.query.filter_by(id=meal_id, user_id=current_user.id).first()
+        if not meal:
+            return jsonify({'error': 'Meal not found or you do not have permission to edit it'}), 404
+
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file part'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No selected file'}), 400
+
+        if file:
+            bucket_name = os.environ.get('S3_BUCKET_NAME')
+            # create a unique filename for the image
+            object_name = f"user_{current_user.id}_meal_{meal.id}_{file.filename}"
+            image_url = upload_file_to_s3(file, bucket_name, object_name)
+            if image_url:
+                meal.image_url = image_url
+                db.session.commit()
+                return jsonify({'message': 'Image uploaded successfully', 'meal': meal.to_dict()}), 200
+            else:
+                return jsonify({'error': 'Failed to upload image to S3'}), 500
+    
+    except Exception as e:
+        return jsonify({'error': f'Failed to upload image: {str(e)}'}), 500
+
+@meals_bp.route('/meals/reminders/send', methods=['POST'])
+@token_required
+def send_meal_reminders(current_user):
+    '''Send meal reminders to the current user'''
+    try:
+        now = datetime.now(timezone.utc)
+        end_of_day = now + timedelta(days=1)
+
+        meals = Meal.query.filter(
+            Meal.user_id == current_user.id,
+            Meal.datetime >= now,
+            Meal.datetime < end_of_day
+        ).order_by(Meal.datetime.asc()).all()
+
+        if not meals:
+            return jsonify({'message': 'No upcoming meals in the next 24 hours.'}), 200
+
+        subject = 'Your Upcoming Meal Reminders'
+        html_content = '<h1>Your upcoming meals for the next 24 hours:</h1>'
+        html_content += '<ul>'
+        for meal in meals:
+            html_content += f'<li><strong>{meal.name}</strong> at {meal.datetime.strftime("%Y-%m-%d %H:%M:%S")} UTC</li>'
+        html_content += '</ul>'
+
+        if send_email(current_user.email, subject, html_content):
+            return jsonify({'message': 'Meal reminders sent successfully.'}), 200
+        else:
+            return jsonify({'error': 'Failed to send email.'}), 500
+
+    except Exception as e:
+        return jsonify({'error': f'Failed to send reminders: {str(e)}'}), 500

@@ -34,6 +34,9 @@ def create_app(config_name='default'):
     
     from app.routes.user import user_bp
     app.register_blueprint(user_bp)
+
+    from app.routes.social import social_bp
+    app.register_blueprint(social_bp)
     
     # Register error handlers
     register_error_handlers(app)

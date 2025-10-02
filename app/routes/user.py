@@ -41,7 +41,7 @@ def update_profile(current_user):
 
 @user_bp.route('/password', methods=['PUT'])
 @token_required
-def update__password(current_user):
+def update_password(current_user):
     '''Update the current user's password'''
     data = request.get_json()
     if not data or not data.get('current_password') or not data.get('new_password'):
@@ -64,3 +64,33 @@ def update__password(current_user):
     db.session.commit()
 
     return jsonify({'message': 'Password updated successfully'}), 200
+
+@user_bp.route('/<username>/follow', methods=['POST'])
+@token_required
+def follow(current_user, username):
+    '''Follow a user'''
+    user_to_follow = User.query.filter_by(username=username).first()
+    if not user_to_follow:
+        return jsonify({'error': 'User not found'}), 404
+    
+    if user_to_follow.id == current_user.id:
+        return jsonify({'error': 'You cannot follow yourself'}), 400
+
+    current_user.follow(user_to_follow)
+    db.session.commit()
+    return jsonify({'message': f'You are now following {username}'}), 200
+
+@user_bp.route('/<username>/unfollow', methods=['POST'])
+@token_required
+def unfollow(current_user, username):
+    '''Unfollow a user'''
+    user_to_unfollow = User.query.filter_by(username=username).first()
+    if not user_to_unfollow:
+        return jsonify({'error': 'User not found'}), 404
+
+    if user_to_unfollow.id == current_user.id:
+        return jsonify({'error': 'You cannot unfollow yourself'}), 400
+
+    current_user.unfollow(user_to_unfollow)
+    db.session.commit()
+    return jsonify({'message': f'You have unfollowed {username}'}), 200
