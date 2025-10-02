@@ -88,7 +88,7 @@ Daily Diet API is a professional project that provides a complete backend soluti
 
 ### 1. Clone the repository  
 ```bash
-git clone https://github.com/yourusername/daily-diet-api.git
+https://github.com/NatashaBaudelaire/dailydietapi.git
 cd daily-diet-api
 ```
 
